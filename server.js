@@ -8,24 +8,24 @@ fastify.get("/", async () => ({ ok: true }));
 
 const server = createServer(fastify.server);
 
-const wss = new WebSocketServer({ server });
+const webSocketServer = new WebSocketServer({ server });
 
-wss.on("connection", (ws) => {
+webSocketServer.on("connection", (webSocket) => {
     console.log("🟢 Client connected");
 
-    ws.on("message", (msg) => {
+    webSocket.on("message", (msg) => {
         const data = JSON.parse(msg);
 
         console.log("📩", data);
 
-        wss.clients.forEach((client) => {
-            if (client !== ws && client.readyState === ws.OPEN) {
+        webSocketServer.clients.forEach((client) => {
+            if (client !== webSocket && client.readyState === webSocket.OPEN) {
                 client.send(JSON.stringify(data));
             }
         });
     });
 
-    ws.on("close", () => console.log("🔴 Client disconnected"));
+    webSocket.on("close", () => console.log("🔴 Client disconnected"));
 });
 
 const PORT = process.env.PORT || 3001;
