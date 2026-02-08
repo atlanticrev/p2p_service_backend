@@ -1,59 +1,143 @@
 import Fastify from "fastify";
-import { WebSocketServer } from "ws";
-import { createServer } from "http";
+import { WebSocket, WebSocketServer } from "ws";
 
 const fastify = Fastify();
+const webSocketServer = new WebSocketServer({ server: fastify.server });
+
+const ROOM_CAPACITY = 2;
+const readyClients = new Set();
+
+const sendJson = (client, payload) => {
+    if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(payload));
+    }
+};
+
+const getRoomStatePayload = () => ({
+    type: "roomState",
+    participants: readyClients.size,
+    capacity: ROOM_CAPACITY,
+});
+
+const broadcastRoomState = () => {
+    const payload = getRoomStatePayload();
+    readyClients.forEach((client) => {
+        sendJson(client, payload);
+    });
+};
+
+const startOfferIfRoomReady = () => {
+    if (readyClients.size !== ROOM_CAPACITY) {
+        return;
+    }
+
+    const [offerOwner] = Array.from(readyClients);
+
+    console.log("🎬 Both clients ready — starting offer phase");
+    sendJson(offerOwner, { type: "startOffer" });
+    readyClients.forEach((client) => {
+        sendJson(client, { type: "status", message: "Connecting..." });
+    });
+};
+
+const removeFromReadyClients = (client) => {
+    const wasInRoom = readyClients.delete(client);
+
+    if (!wasInRoom) {
+        return;
+    }
+
+    broadcastRoomState();
+};
+
+const relayToRoomPeers = (sourceClient, payload) => {
+    readyClients.forEach((client) => {
+        if (client !== sourceClient && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(payload));
+        }
+    });
+};
+
 fastify.get("/", async () => ({ ok: true }));
 
-const server = createServer(fastify.server);
-const webSocketServer = new WebSocketServer({ server });
+fastify.get("/room-state", async (_request, reply) => {
+    reply.header("Access-Control-Allow-Origin", "*");
+    reply.header("Cache-Control", "no-store");
 
-const readyClients = new Set();
+    return {
+        participants: readyClients.size,
+        capacity: ROOM_CAPACITY,
+    };
+});
 
 webSocketServer.on("connection", (webSocket) => {
     console.log("🟢 Client connected");
 
     webSocket.on("message", (msg) => {
-        const data = JSON.parse(msg);
-        console.log("📩", data);
+        let data;
 
-        // ✅ Когда клиент нажал "Позвонить"
-        if (data.type === "ready") {
-            readyClients.add(webSocket);
-
-            // Когда готовы двое — запускаем звонок
-            if (readyClients.size === 2) {
-                const [first] = Array.from(readyClients);
-
-                console.log("🎬 Both clients ready — starting offer phase");
-
-                // Первому отправляем "startOffer"
-                first.send(JSON.stringify({ type: "startOffer" }));
-
-                // Обоим сообщаем, что соединение начинается
-                readyClients.forEach((client) =>
-                    client.send(JSON.stringify({ type: "status", message: "Connecting..." }))
-                );
-            }
+        try {
+            data = JSON.parse(msg.toString());
+        } catch {
+            sendJson(webSocket, { type: "error", message: "Invalid JSON payload" });
 
             return;
         }
 
-        webSocketServer.clients.forEach((client) => {
-            if (client !== webSocket && client.readyState === webSocket.OPEN) {
-                client.send(JSON.stringify(data));
+        if (!data?.type) {
+            sendJson(webSocket, { type: "error", message: "Missing message type" });
+
+            return;
+        }
+
+        console.log("📩", data);
+
+        // ✅ Когда клиент нажал "Присоединиться к комнате"
+        if (data.type === "ready") {
+            if (readyClients.has(webSocket)) {
+                sendJson(webSocket, getRoomStatePayload());
+
+                return;
             }
-        });
+
+            if (readyClients.size >= ROOM_CAPACITY) {
+                sendJson(webSocket, { type: "roomFull", message: "Room is full" });
+                sendJson(webSocket, getRoomStatePayload());
+
+                return;
+            }
+
+            readyClients.add(webSocket);
+            broadcastRoomState();
+            startOfferIfRoomReady();
+
+            return;
+        }
+
+        if (data.type === "hangup" || data.type === "leave") {
+            removeFromReadyClients(webSocket);
+            relayToRoomPeers(webSocket, { type: "hangup" });
+
+            return;
+        }
+
+        relayToRoomPeers(webSocket, data);
     });
 
     webSocket.on("close", () => {
         console.log("🔴 Client disconnected");
-        readyClients.delete(webSocket);
+        relayToRoomPeers(webSocket, { type: "hangup" });
+        removeFromReadyClients(webSocket);
     });
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
-server.listen(PORT, "0.0.0.0", () => {
+fastify.listen({ port: PORT, host: "0.0.0.0" }, (error) => {
+    if (error) {
+        console.error(error);
+        process.exit(1);
+    }
+
     console.log(`✅ Fastify WebSocket server running on port ${PORT}`);
 });
