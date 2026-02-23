@@ -5,11 +5,21 @@ const fastify = Fastify();
 const webSocketServer = new WebSocketServer({ server: fastify.server });
 
 const ROOM_CAPACITY = 2;
+const HEARTBEAT_INTERVAL_MS = 10_000;
+const connectedClients = new Set();
 const readyClients = new Set();
 
 const sendJson = (client, payload) => {
-    if (client.readyState === WebSocket.OPEN) {
+    if (client.readyState !== WebSocket.OPEN) {
+        return false;
+    }
+
+    try {
         client.send(JSON.stringify(payload));
+        return true;
+    } catch (error) {
+        console.warn("Failed to send WS message", error);
+        return false;
     }
 };
 
@@ -21,9 +31,13 @@ const getRoomStatePayload = () => ({
 
 const broadcastRoomState = () => {
     const payload = getRoomStatePayload();
-    readyClients.forEach((client) => {
+    connectedClients.forEach((client) => {
         sendJson(client, payload);
     });
+};
+
+const removeConnectionClient = (client) => {
+    connectedClients.delete(client);
 };
 
 const startOfferIfRoomReady = () => {
@@ -44,34 +58,100 @@ const removeFromReadyClients = (client) => {
     const wasInRoom = readyClients.delete(client);
 
     if (!wasInRoom) {
-        return;
+        return false;
     }
 
     broadcastRoomState();
+    return true;
+};
+
+const cleanUpClient = (client, options = {}) => {
+    const { notifyPeers = false, reason = "unknown" } = options;
+    const wasInRoom = removeFromReadyClients(client);
+    const wasConnected = connectedClients.has(client);
+
+    removeConnectionClient(client);
+
+    if (wasInRoom || wasConnected) {
+        console.log("🧹 Client cleanup", {
+            reason,
+            wasInRoom,
+            wasConnected,
+            notifyPeers,
+            readyState: client.readyState,
+            roomParticipants: readyClients.size,
+        });
+    }
+
+    if (notifyPeers && wasInRoom) {
+        relayToRoomPeers(client, { type: "hangup" });
+    }
+
+    return wasInRoom;
+};
+
+const pruneClosedClients = () => {
+    connectedClients.forEach((client) => {
+        if (client.readyState === WebSocket.CLOSING || client.readyState === WebSocket.CLOSED) {
+            cleanUpClient(client, { notifyPeers: true, reason: "prune-not-open" });
+        }
+    });
 };
 
 const relayToRoomPeers = (sourceClient, payload) => {
     readyClients.forEach((client) => {
-        if (client !== sourceClient && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(payload));
+        if (client === sourceClient) {
+            return;
         }
+
+        if (client.readyState !== WebSocket.OPEN) {
+            cleanUpClient(client, { reason: "relay-target-not-open" });
+            return;
+        }
+
+        sendJson(client, payload);
     });
 };
 
 fastify.get("/", async () => ({ ok: true }));
 
-fastify.get("/room-state", async (_request, reply) => {
-    reply.header("Access-Control-Allow-Origin", "*");
-    reply.header("Cache-Control", "no-store");
+const heartbeatTimer = setInterval(() => {
+    connectedClients.forEach((client) => {
+        if (client.readyState !== WebSocket.OPEN) {
+            cleanUpClient(client, { notifyPeers: true, reason: "heartbeat-not-open" });
+            return;
+        }
 
-    return {
-        participants: readyClients.size,
-        capacity: ROOM_CAPACITY,
-    };
-});
+        if (client.isAlive === false) {
+            console.log("💀 Stale WebSocket detected, terminating");
+            cleanUpClient(client, { notifyPeers: true, reason: "heartbeat-timeout" });
+            client.terminate();
+            return;
+        }
+
+        client.isAlive = false;
+
+        try {
+            client.ping();
+        } catch (error) {
+            console.warn("Failed to ping client", error);
+            cleanUpClient(client, { notifyPeers: true, reason: "heartbeat-ping-error" });
+            client.terminate();
+        }
+    });
+}, HEARTBEAT_INTERVAL_MS);
+
+heartbeatTimer.unref?.();
 
 webSocketServer.on("connection", (webSocket) => {
     console.log("🟢 Client connected");
+    connectedClients.add(webSocket);
+    webSocket.isAlive = true;
+    sendJson(webSocket, getRoomStatePayload());
+
+    webSocket.on("pong", () => {
+        webSocket.isAlive = true;
+    });
 
     webSocket.on("message", (msg) => {
         let data;
@@ -94,6 +174,8 @@ webSocketServer.on("connection", (webSocket) => {
 
         // ✅ Когда клиент нажал "Присоединиться к комнате"
         if (data.type === "ready") {
+            pruneClosedClients();
+
             if (readyClients.has(webSocket)) {
                 sendJson(webSocket, getRoomStatePayload());
 
@@ -115,8 +197,15 @@ webSocketServer.on("connection", (webSocket) => {
         }
 
         if (data.type === "hangup" || data.type === "leave") {
-            removeFromReadyClients(webSocket);
-            relayToRoomPeers(webSocket, { type: "hangup" });
+            const wasInRoom = removeFromReadyClients(webSocket);
+
+            if (wasInRoom) {
+                console.log("🧹 Room slot released", {
+                    reason: `client-${data.type}`,
+                    roomParticipants: readyClients.size,
+                });
+                relayToRoomPeers(webSocket, { type: "hangup" });
+            }
 
             return;
         }
@@ -124,11 +213,21 @@ webSocketServer.on("connection", (webSocket) => {
         relayToRoomPeers(webSocket, data);
     });
 
-    webSocket.on("close", () => {
-        console.log("🔴 Client disconnected");
-        relayToRoomPeers(webSocket, { type: "hangup" });
-        removeFromReadyClients(webSocket);
+    webSocket.on("close", (code, reasonBuffer) => {
+        console.log("🔴 Client disconnected", {
+            code,
+            reason: reasonBuffer?.toString() || null,
+        });
+        cleanUpClient(webSocket, { notifyPeers: true, reason: "socket-close" });
     });
+
+    webSocket.on("error", (error) => {
+        console.warn("WebSocket connection error", error);
+    });
+});
+
+webSocketServer.on("close", () => {
+    clearInterval(heartbeatTimer);
 });
 
 const PORT = Number(process.env.PORT) || 3001;
